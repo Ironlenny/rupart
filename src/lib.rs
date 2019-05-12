@@ -9,6 +9,8 @@ use itertools::Itertools;
 use md5::{Digest, Md5};
 use rayon::prelude::*;
 use rayon::{join, spawn};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::metadata;
 use std::fs::File;
 use std::io::prelude::*;
@@ -16,8 +18,6 @@ use std::mem::drop;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
-use std::collections::{HashMap, BinaryHeap};
-use std::cmp::Ordering;
 
 // File creation pipeline
 #[derive(Debug)]
@@ -188,13 +188,13 @@ impl Buffer {
         Buffer {
             heap: BinaryHeap::new(),
             count: 0,
-            num_blocks: 0
+            num_blocks: 0,
         }
     }
 
     fn is_done(&self) -> bool {
         if self.num_blocks == self.count {
-            return true
+            return true;
         }
 
         false
@@ -210,7 +210,7 @@ impl Buffer {
         //Check for first blocks
         if block.index == 0 {
             self.count = self.count + 1;
-             result = Some(block);
+            result = Some(block);
         }
         // Check if current block is the one we need
         else if self.count > 0 && block.index == self.count {
@@ -219,7 +219,11 @@ impl Buffer {
         }
         // Check if root is the one we need
         else if !self.heap.is_empty() {
-            if { let root = self.heap.peek().unwrap(); root.index } == self.count {
+            if {
+                let root = self.heap.peek().unwrap();
+                root.index
+            } == self.count
+            {
                 result = Some(self.heap.pop().unwrap());
             }
         }
@@ -245,12 +249,12 @@ pub enum Body {
 // Message enum indicates the type of message, and contains a message body
 #[derive(Debug)]
 pub enum Message {
-    Writes(Header<Body>),                                    // writes Packet
-    Main(Arc<[u8; 16]>),                                     // main file_id
-    Input((Arc<[u8; 16]>, PathBuf, u64)),                    // input (file_id, file, length)
+    Writes(Header<Body>),                                          // writes Packet
+    Main(Arc<[u8; 16]>),                                           // main file_id
+    Input((Arc<[u8; 16]>, PathBuf, u64)),                          // input (file_id, file, length)
     FileDescription((Vec<u8>, u64, Box<[u8; 16]>, Arc<[u8; 16]>)), // file_descript (name, length, hash_16k, file_id)
-    Block(Arc<Block>),                                            // recovery Block
-    Body(Body),                                              // packet Body
+    Block(Arc<Block>),                                             // recovery Block
+    Body(Body),                                                    // packet Body
 }
 
 // Helper function to convert Vec's to byte arrays
@@ -329,7 +333,9 @@ fn create_file_id(
             tx_router
                 .send(Message::Input((Arc::clone(&file_id), file, length)))
                 .unwrap();
-            tx_router.send(Message::FileDescription(partial_body)).unwrap();
+            tx_router
+                .send(Message::FileDescription(partial_body))
+                .unwrap();
         });
     }
     drop(tx_id);
@@ -381,11 +387,7 @@ fn create_main(
 // Third Stage: Take file ids, file readers, and block_size; and create an input body
 // containing file id and block checksums. Iterate through the file reader calculating
 // block hashs. Put hashs in a Vec. Send complete body to create_packet(). Bock size is bytes
-fn create_input_body(
-    rx_input: Receiver<Message>,
-    tx_router: Sender<Message>,
-    block_size: usize,
-) {
+fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>, block_size: usize) {
     for received in rx_input {
         let file_hash = Md5::new();
         let (tx_block, rx_block) = channel();
@@ -414,7 +416,9 @@ fn create_input_body(
                         num_blocks: num_blocks,
                     });
 
-                    tx_router.send(Message::Block(Arc::clone(&message_block))).unwrap();
+                    tx_router
+                        .send(Message::Block(Arc::clone(&message_block)))
+                        .unwrap();
 
                     let tx_block = tx_block.clone();
 
@@ -488,10 +492,14 @@ fn create_input_body(
 // }
 
 // Fifth Stage
-fn create_file_description(rx_fd: Receiver<Message>, tx_router: Sender<Message>, file_ids: Arc<RwLock<Vec<[u8; 16]>>>) {
+fn create_file_description(
+    rx_fd: Receiver<Message>,
+    tx_router: Sender<Message>,
+    file_ids: Arc<RwLock<Vec<[u8; 16]>>>,
+) {
     let file_ids = file_ids.read().unwrap();
     let mut senders: HashMap<&[u8; 16], Sender<Arc<Block>>> = HashMap::new();
-    let mut buffers: HashMap<&[u8;16], Buffer> = HashMap::new();
+    let mut buffers: HashMap<&[u8; 16], Buffer> = HashMap::new();
     let mut recvs = HashMap::new();
 
     for id in &*file_ids {
@@ -501,35 +509,33 @@ fn create_file_description(rx_fd: Receiver<Message>, tx_router: Sender<Message>,
         recvs.insert(id, rx);
     }
 
-
     for received in rx_fd {
         match received {
             Message::FileDescription(partial) => {
                 let (name, length, hash_16k, file_id) = partial;
                 let tx_router = tx_router.clone();
                 let rx = recvs.remove(&*file_id).unwrap();
-                     spawn(move || {
+                spawn(move || {
+                    let body = Body::FileDescription(FileDescription {
+                        file_id: Arc::clone(&file_id),
+                        file_hash: {
+                            let mut hasher = Md5::new();
 
-                         let body = Body::FileDescription(FileDescription {
-                             file_id: Arc::clone(&file_id),
-                             file_hash: {
-                                 let mut hasher = Md5::new();
+                            for block in rx {
+                                hasher.input(&*block.data);
+                            }
 
-                                 for block in rx {
-                                     hasher.input(&*block.data);
-                                 }
+                            let result = hasher.result().to_vec();
+                            convert_to_byte_array(result)
+                        },
+                        hash_16k: *hash_16k,
+                        length: length,
+                        name: name,
+                    });
 
-                                 let result = hasher.result().to_vec();
-                                 convert_to_byte_array(result)
-                             },
-                             hash_16k: *hash_16k,
-                             length: length,
-                             name: name,
-                         });
-
-                         tx_router.send(Message::Body(body)).unwrap();
-                     });
-            },
+                    tx_router.send(Message::Body(body)).unwrap();
+                });
+            }
             Message::Block(block) => {
                 let id = &*block.file_id;
                 let tx = &senders[id];
@@ -542,15 +548,14 @@ fn create_file_description(rx_fd: Receiver<Message>, tx_router: Sender<Message>,
                             drop(tx);
                         }
 
-                        continue
-                    },
-                    None => continue
+                        continue;
+                    }
+                    None => continue,
                 }
-            },
-            _ => panic!("No valid message")
+            }
+            _ => panic!("No valid message"),
         }
     }
-
 
     // spawn(move || {
     //     let hashers = Arc::clone(&hashers);
@@ -616,6 +621,7 @@ mod test {
     use typename::TypeName;
 
     static PATH: &str = "/home/jacob/projects/rupart/test_file";
+    static NAME: &[u8; 9] = b"test_file";
 
     lazy_static! {
         static ref FILE_ID: [u8; 16] = hex!("7a9b4bacc05e6c2eb59f25c687f900c4");
@@ -630,6 +636,20 @@ mod test {
 
     lazy_static! {
         static ref NUM_BLOCKS: usize = LENGTH as usize / BLOCK_SIZE;
+    }
+
+    lazy_static! {
+        static ref BLOCKS: Vec<Vec<u8>> = {
+            let path = PathBuf::from(&PATH);
+            let mut blocks = Vec::new();
+            let reader = File::open(&path).unwrap();
+
+            for chunk in reader.bytes().chunks(BLOCK_SIZE).into_iter() {
+                let block: Vec<u8> = chunk.map(|x| x.unwrap()).collect();
+                blocks.push(block.clone());
+            }
+            blocks
+        };
     }
 
     #[test]
@@ -668,7 +688,7 @@ mod test {
         }
 
         let lock = pipeline.file_ids.write().unwrap();
-        create_file_id(tx_router,path_vec, lock);
+        create_file_id(tx_router, path_vec, lock);
         // End setup
 
         // Test input channel
@@ -704,7 +724,7 @@ mod test {
 
                     // Test length
                     assert_eq!(LENGTH, received.2, "File length is wrong.");
-                },
+                }
                 Message::FileDescription(fd) => {
                     let received = fd;
                     // Test partial body
@@ -715,15 +735,15 @@ mod test {
                     );
 
                     // Test name
-                    assert_eq!(*b"test_file", received.0[..], "File name is wrong");
+                    assert_eq!(*NAME, received.0[..], "File name is wrong");
                     // Test first 16k hash
                     assert_eq!(
-                        hex!("54e39774f15c24a19b8553e3a2408af1"),
+                        *HASH_16K,
                         received.2[..],
                         "Hash of first 16k is wrong"
                     );
                     // Test length
-                    assert_eq!(1048576, received.1, "length is wrong");
+                    assert_eq!(LENGTH, received.1, "length is wrong");
 
                     // Test file_ids
                     let file_ids = pipeline.file_ids.read().unwrap();
@@ -731,7 +751,7 @@ mod test {
                     for id in &*file_ids {
                         assert_eq!(id, &*FILE_ID);
                     }
-                },
+                }
                 _ => panic!("No valid message"),
             }
         }
@@ -747,14 +767,8 @@ mod test {
         let (tx_input, rx_input) = channel();
         let mut hashs_md5 = Vec::new();
         let mut hashs_crc = Vec::new();
-        let mut blocks = Vec::new();
-        let reader = File::open(&path).unwrap();
-        let length: u64 = 1048576;
 
-        for chunk in reader.bytes().chunks(block_size).into_iter() {
-            let block: Vec<u8> = chunk.map(|x| x.unwrap()).collect();
-            blocks.push(block.clone());
-
+        for block in &*BLOCKS {
             join(
                 || {
                     let hash = Md5::digest(&block.clone());
@@ -771,7 +785,7 @@ mod test {
         }
 
         let mut hashs = hashs_md5.into_iter().zip(hashs_crc.into_iter());
-        let input = Message::Input((Arc::new(FILE_ID.to_owned()), path, length));
+        let input = Message::Input((Arc::new(FILE_ID.to_owned()), path, LENGTH));
         tx_input.send(input);
         drop(tx_input);
         create_input_body(rx_input, tx_router, block_size);
@@ -805,7 +819,7 @@ mod test {
 
                     // Should have 16 blocks
                     assert_eq!(count, 16);
-                },
+                }
                 Message::Block(block) => {
                     let block = block;
                     // Tests
@@ -814,14 +828,14 @@ mod test {
                     // data at index
                     assert!({
                         let mut result = false;
-                        if *block.data == blocks[block.index] {
+                        if *block.data == BLOCKS[block.index] {
                             result = true
                         }
                         result
                     });
                     // vec_length
                     assert_eq!(block.num_blocks, num_blocks);
-                },
+                }
                 _ => panic!("No valid message"),
             }
         }
@@ -839,16 +853,16 @@ mod test {
         let mut buffer = [0; FIRST_16K];
         let reader = File::open(&path).unwrap();
 
-        for (i, chunk) in reader.bytes().chunks(BLOCK_SIZE).into_iter().enumerate() {
-            let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
-
+        for (i, block) in BLOCKS.iter().enumerate() {
             if i == 0 {
-            for (i, byte) in block.iter().enumerate() {
-                if i < FIRST_16K {
-                    buffer[i] = *byte;
+                for (i, byte) in block.iter().enumerate() {
+                    if i < FIRST_16K {
+                        buffer[i] = *byte;
+                    }
                 }
             }
-            }
+
+            let block = Arc::new(block.to_owned());
 
             let message_block = Arc::new(Block {
                 file_id: Arc::new(FILE_ID.to_owned()),
@@ -863,7 +877,12 @@ mod test {
 
         let hasher = Md5::digest(&buffer);
         let hasher = Box::new(convert_to_byte_array(hasher.to_vec()));
-        let partial = (PATH.as_bytes().to_vec(), LENGTH.to_owned(), hasher, Arc::new(FILE_ID.to_owned()));
+        let partial = (
+            PATH.as_bytes().to_vec(),
+            LENGTH.to_owned(),
+            hasher,
+            Arc::new(FILE_ID.to_owned()),
+        );
         tx_fd.send(Message::FileDescription(partial)).unwrap();
         drop(tx_fd);
         create_file_description(rx_fd, tx_router, file_ids);
@@ -879,7 +898,11 @@ mod test {
         // Test file id
         assert_eq!(body.file_id[..], *FILE_ID, "Wrong file id");
         // Test hash
-        assert_eq!(body.file_hash[..], hex!("7a27aa352924434d042415ab8fa477cf"), "Wrong file hash");
+        assert_eq!(
+            body.file_hash[..],
+            hex!("7a27aa352924434d042415ab8fa477cf"),
+            "Wrong file hash"
+        );
         // Test hash_16k
         assert_eq!(body.hash_16k[..], *HASH_16K, "Wrong hash of first 16k");
         // Test length
