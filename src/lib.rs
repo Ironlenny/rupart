@@ -259,7 +259,7 @@ enum Close {
 pub enum Message {
     Packet(Header<Body>),                                          // writes Packet
     Main(Arc<[u8; 16]>),                                           // main file_id
-    Input((Arc<[u8; 16]>, PathBuf, u64)),                          // input (file_id, file, length)
+    Input(Block),                                                  // input (file_id, file, length)
     FileDescription((Vec<u8>, u64, Box<[u8; 16]>, Arc<[u8; 16]>)), // file_descript (name, length, hash_16k, file_id)
     Block(Arc<Block>),                                             // recovery Block
     Body(Body),                                                    // packet Body
@@ -505,63 +505,57 @@ fn create_main(
 // Third Stage: Take file ids, file readers, and block_size; and create an input body
 // containing file id and block checksums. Iterate through the file reader calculating
 // block hashs. Put hashs in a Vec. Send complete body to create_packet(). Bock size is bytes
-fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>, block_size: usize) {
+fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>) {
     for received in rx_input {
         let file_hash = Md5::new();
         let (tx_block, rx_block) = channel();
-        let (file_id, file, length) = match received {
+        let mut block = match received {
             Message::Input(input) => input,
             _ => panic!(),
         };
 
+        // Check if block needs padding
+        if block.data.len() < block.block_size {
+            let mut temp: Arc<Vec<u8>> = Arc::new(vec![0; block.block_size]);
+
+            for i in 0..block.block_size {
+                temp[i] = block.data[i];
+            }
+
+            block.data = temp;
+        }
+
+        let block = block;
+
         let body = Body::Input(Input {
-            file_id: Arc::clone(&file_id),
+            file_id: Arc::clone(&block.file_id),
             block_checksums: {
-                let reader = File::open(file).unwrap();
-                let num_blocks: usize = length as usize / block_size;
                 // Pre-allocate block_checksums vector to eliminate the need for sorting
-                let mut block_checksums: Vec<([u8; 16], u32)> = vec![([0; 16], 0); num_blocks];
+                let mut block_checksums: Vec<([u8; 16], u32)> =
+                    vec![([0; 16], 0); block.num_blocks];
 
-                // Iterate through file a byte at a time and collect
-                // block_size bytes as chunks. Innumerate each chunk
-                for (i, chunk) in reader.bytes().chunks(block_size).into_iter().enumerate() {
-                    let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
-                    let message_block = Arc::new(Block {
-                        file_id: Arc::clone(&file_id),
-                        index: i.clone(),
-                        data: Arc::clone(&block),
-                        // vec_length: block_size,
-                        num_blocks: num_blocks,
-                    });
+                let tx_block = tx_block.clone();
 
-                    tx_router
-                        .send(Message::Block(Arc::clone(&message_block)))
-                        .unwrap();
+                spawn(move || {
+                    let mut md5_sum = Vec::new();
+                    let mut crc_sum = 0;
 
-                    let tx_block = tx_block.clone();
+                    join(
+                        || {
+                            let mut hasher_md5 = Md5::new();
+                            hasher_md5.input(&*block.data);
+                            md5_sum = hasher_md5.result().to_vec();
+                        },
+                        || {
+                            let mut hasher_crc32 = Hasher::new();
+                            hasher_crc32.update(&*block.data);
+                            crc_sum = hasher_crc32.finalize();
+                        },
+                    );
 
-                    spawn(move || {
-                        let block = Arc::clone(&block);
-                        let mut md5_sum = Vec::new();
-                        let mut crc_sum = 0;
-
-                        join(
-                            || {
-                                let mut hasher_md5 = Md5::new();
-                                hasher_md5.input(&*block);
-                                md5_sum = hasher_md5.result().to_vec();
-                            },
-                            || {
-                                let mut hasher_crc32 = Hasher::new();
-                                hasher_crc32.update(&*block);
-                                crc_sum = hasher_crc32.finalize();
-                            },
-                        );
-
-                        let result = (i, md5_sum, crc_sum);
-                        tx_block.send(result).unwrap();
-                    });
-                }
+                    let result = (block.index, md5_sum, crc_sum);
+                    tx_block.send(result).unwrap();
+                });
 
                 // Close block channel
                 drop(tx_block);
