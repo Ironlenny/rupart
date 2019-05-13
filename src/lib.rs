@@ -19,8 +19,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+// First 16 KiB of a file
+static FIRST_16K: usize = 16384;
+
 // File creation pipeline
-#[derive(Debug)]
+
 pub struct CreatorPipeline {
     magic: Arc<[u8; 8]>,
     rec_set_id: Arc<RwLock<[u8; 16]>>,
@@ -63,7 +66,7 @@ trait Type {
 // Hashs are 16 bytes (&[u8; 16])
 
 // Header for all packets
-#[derive(Debug)]
+
 pub struct Header<T> {
     magic: Arc<[u8; 8]>,               // ASCII string
     length: u64,        // Packet length starting at first byte of rec_set_id. 8 bytes
@@ -74,7 +77,7 @@ pub struct Header<T> {
 }
 
 // Main packet body
-#[derive(Debug)]
+
 pub struct Main {
     block_size: u64,
     num_files: u32, // 4 bytes
@@ -90,7 +93,7 @@ impl Type for Main {
 }
 
 // File Description packet body
-#[derive(Debug)]
+
 pub struct FileDescription {
     file_id: Arc<[u8; 16]>,
     file_hash: [u8; 16],
@@ -107,7 +110,7 @@ impl Type for FileDescription {
 }
 
 // Input File Block Checksum packet body
-#[derive(Debug)]
+
 pub struct Input {
     file_id: Arc<[u8; 16]>,
     block_checksums: Vec<([u8; 16], u32)>, // Hash and CRC32 tuple
@@ -121,7 +124,7 @@ impl Type for Input {
 }
 
 // Recovery Block packet body
-#[derive(Debug)]
+
 pub struct Recovery {
     exponent: u32,
     blocks: Vec<u32>,
@@ -135,7 +138,7 @@ impl Type for Recovery {
 }
 
 // Creator packet body
-#[derive(Debug)]
+
 pub struct Creator {
     id: [u8; 16], // ASCII string
 }
@@ -149,13 +152,15 @@ impl Type for Creator {
 
 // Block Convenience struct. The spec references slices. Slices and blocks are
 // the same thing. A block is an array of 16-bit values
-#[derive(Debug, Eq)]
+#[derive(Eq)]
 pub struct Block {
-    file_id: Arc<[u8; 16]>,
+    path: PathBuf,
+    file_id: Option<Arc<[u8; 16]>>,
     index: usize,
     data: Arc<Vec<u8>>,
-    // vec_length: usize,
+    block_size: usize,
     num_blocks: usize,
+    length: u64,
 }
 
 impl PartialOrd for Block {
@@ -237,7 +242,6 @@ impl Buffer {
 }
 
 // Body enum indicates the type of packet body, and contains a body struct
-#[derive(Debug)]
 pub enum Body {
     Main(Main),
     FileDescription(FileDescription),
@@ -246,15 +250,21 @@ pub enum Body {
     Creator(Creator),
 }
 
+// Signal which channel to close
+enum Close {
+    FileID,
+    Block,
+}
+
 // Message enum indicates the type of message, and contains a message body
-#[derive(Debug)]
 pub enum Message {
-    Writes(Header<Body>),                                          // writes Packet
+    Packet(Header<Body>),                                          // writes Packet
     Main(Arc<[u8; 16]>),                                           // main file_id
     Input((Arc<[u8; 16]>, PathBuf, u64)),                          // input (file_id, file, length)
     FileDescription((Vec<u8>, u64, Box<[u8; 16]>, Arc<[u8; 16]>)), // file_descript (name, length, hash_16k, file_id)
     Block(Arc<Block>),                                             // recovery Block
     Body(Body),                                                    // packet Body
+    Close(Close),                                                  // Close a channel
 }
 
 // Helper function to convert Vec's to byte arrays
@@ -266,6 +276,105 @@ fn convert_to_byte_array(vec: Vec<u8>) -> [u8; 16] {
     }
 
     temp
+}
+
+// `get_input()` makes `Blocks` from a file.
+fn get_input(tx_router: Sender<Message>, files: Vec<PathBuf>, block_size: usize) {
+    // `MessageBlock` is an iterator that makes `Blocks`
+    struct MessageBlock {
+        path: PathBuf,
+        reader: File,
+        block_size: usize,
+        num_blocks: usize,
+        length: u64,
+    }
+
+    impl MessageBlock {
+        fn new(path: PathBuf, block_size: usize) -> Self {
+            let length = {
+                let metadata = metadata(&path).unwrap();
+                metadata.len()
+            };
+
+            MessageBlock {
+                path: path,
+                reader: { File::open(&path).unwrap() },
+                block_size: block_size,
+                num_blocks: { length as usize / block_size },
+                length: length,
+            }
+        }
+    }
+
+    impl Iterator for MessageBlock {
+        type Item = Block;
+
+        fn next(&mut self) -> Option<Block> {
+            let result = match self
+                .reader
+                .bytes()
+                .chunks(self.block_size)
+                .into_iter()
+                .enumerate()
+                .next()
+            {
+                Some(next) => {
+                    let (i, chunk) = next;
+                    let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
+
+                    let message_block = Block {
+                        path: self.path,
+                        file_id: None,
+                        index: i,
+                        data: Arc::clone(&block),
+                        block_size: self.block_size,
+                        num_blocks: self.num_blocks,
+                        length: self.length,
+                    };
+
+                    Some(message_block)
+                }
+                None => None,
+            };
+
+            result
+        }
+    }
+
+    let mut readers = Vec::new();
+
+    for file in files {
+        readers.push({ MessageBlock::new(file, block_size) });
+    }
+
+    // Send first blocks so file ids can be created
+    readers.iter().for_each(|reader| {
+        reader
+            .into_iter()
+            // Send enough blocks for the first 16KiB
+            .chunks(FIRST_16K % block_size)
+            .into_iter()
+            .for_each(|chunk| {
+                chunk.for_each(|block| {
+                    let message = Message::Block(Arc::new(block));
+                    tx_router.send(message);
+                })
+            })
+    });
+
+    // Close file id channel
+    tx_router.send(Message::Close(Close::FileID));
+
+    // Send the rest of them
+    readers.iter().for_each(|reader| {
+        reader.for_each(|message| {
+            let message = Message::Block(Arc::new(message));
+            tx_router.send(message);
+        });
+    });
+
+    // Close block channels
+    tx_router.send(Message::Close(Close::Block));
 }
 
 // First Stage: Create file ids and partial bodies for FileDescription. Send
@@ -283,7 +392,7 @@ fn create_file_id(
         let mut reader = File::open(&file)
             .with_context(|_| format!("Could not open file {}", file.display()))
             .unwrap();
-        let mut buffer = [0; 16384];
+        let mut buffer = [0; FIRST_16K];
         reader.read(&mut buffer).unwrap();
 
         // Spawn thread
@@ -400,8 +509,8 @@ fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>, bl
             file_id: Arc::clone(&file_id),
             block_checksums: {
                 let reader = File::open(file).unwrap();
-                // Pre-allocate block_checksums vector to eliminate the need for sorting
                 let num_blocks: usize = length as usize / block_size;
+                // Pre-allocate block_checksums vector to eliminate the need for sorting
                 let mut block_checksums: Vec<([u8; 16], u32)> = vec![([0; 16], 0); num_blocks];
 
                 // Iterate through file a byte at a time and collect
@@ -737,11 +846,7 @@ mod test {
                     // Test name
                     assert_eq!(*NAME, received.0[..], "File name is wrong");
                     // Test first 16k hash
-                    assert_eq!(
-                        *HASH_16K,
-                        received.2[..],
-                        "Hash of first 16k is wrong"
-                    );
+                    assert_eq!(*HASH_16K, received.2[..], "Hash of first 16k is wrong");
                     // Test length
                     assert_eq!(LENGTH, received.1, "length is wrong");
 
