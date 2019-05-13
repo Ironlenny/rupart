@@ -154,8 +154,7 @@ impl Type for Creator {
 // the same thing. A block is an array of 16-bit values
 #[derive(Eq)]
 pub struct Block {
-    path: PathBuf,
-    file_id: Option<Arc<[u8; 16]>>,
+    file_id: Arc<[u8; 16]>,
     index: usize,
     data: Arc<Vec<u8>>,
     block_size: usize,
@@ -279,18 +278,30 @@ fn convert_to_byte_array(vec: Vec<u8>) -> [u8; 16] {
 }
 
 // `get_input()` makes `Blocks` from a file.
-fn get_input(tx_router: Sender<Message>, files: Vec<PathBuf>, block_size: usize) {
+fn get_input(
+    tx_router: Sender<Message>,
+    files: Vec<PathBuf>,
+    block_size: usize,
+    mut file_ids: RwLockWriteGuard<Vec<[u8; 16]>>,
+) {
     // `MessageBlock` is an iterator that makes `Blocks`
-    struct MessageBlock {
+    struct MessageBlock<'a> {
         path: PathBuf,
+        file_id: Option<Arc<[u8; 16]>>,
         reader: File,
         block_size: usize,
         num_blocks: usize,
         length: u64,
+        blocks: Vec<Arc<Vec<u8>>>,
+        file_ids: RwLockWriteGuard<'a, Vec<[u8; 16]>>,
     }
 
-    impl MessageBlock {
-        fn new(path: PathBuf, block_size: usize) -> Self {
+    impl<'a> MessageBlock<'a> {
+        fn new(
+            path: PathBuf,
+            block_size: usize,
+            file_ids: RwLockWriteGuard<'a, Vec<[u8; 16]>>,
+        ) -> Self {
             let length = {
                 let metadata = metadata(&path).unwrap();
                 metadata.len()
@@ -298,18 +309,62 @@ fn get_input(tx_router: Sender<Message>, files: Vec<PathBuf>, block_size: usize)
 
             MessageBlock {
                 path: path,
+                file_id: None,
                 reader: { File::open(&path).unwrap() },
                 block_size: block_size,
                 num_blocks: { length as usize / block_size },
                 length: length,
+                blocks: Vec::new(),
+                file_ids: file_ids,
             }
         }
     }
 
-    impl Iterator for MessageBlock {
+    impl<'a> Iterator for MessageBlock<'a> {
         type Item = Block;
 
         fn next(&mut self) -> Option<Block> {
+            let take_bytes = (FIRST_16K % self.block_size + 1) * self.block_size;
+
+            if self.file_id.is_none() {
+                while self.blocks.len() <= FIRST_16K % self.block_size + 1 {
+                    match self
+                        .reader
+                        .bytes()
+                        .chunks(self.block_size)
+                        .into_iter()
+                        .enumerate()
+                        .next()
+                    {
+                        Some(next) => {
+                            let (i, chunk) = next;
+                            let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
+                            self.blocks.push(block);
+                        }
+                        None => panic!("Empty file"),
+                    }
+                }
+
+                let file_id = create_file_id(self.blocks, self.path, self.length);
+                self.file_id = Some(file_id);
+                self.file_ids.push(*file_id);
+            }
+
+            if !self.blocks.is_empty() {
+                let (i, block) = self.blocks.iter().enumerate().next().unwrap();
+
+                let message_block = Block {
+                    file_id: self.file_id.unwrap(),
+                    index: i,
+                    data: block.to_owned(),
+                    block_size: self.block_size,
+                    num_blocks: self.num_blocks,
+                    length: self.length,
+                };
+
+                return Some(message_block);
+            }
+
             let result = match self
                 .reader
                 .bytes()
@@ -320,13 +375,12 @@ fn get_input(tx_router: Sender<Message>, files: Vec<PathBuf>, block_size: usize)
             {
                 Some(next) => {
                     let (i, chunk) = next;
-                    let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
+                    let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
 
                     let message_block = Block {
-                        path: self.path,
-                        file_id: None,
+                        file_id: self.file_id.unwrap(),
                         index: i,
-                        data: Arc::clone(&block),
+                        data: block,
                         block_size: self.block_size,
                         num_blocks: self.num_blocks,
                         length: self.length,
@@ -344,22 +398,13 @@ fn get_input(tx_router: Sender<Message>, files: Vec<PathBuf>, block_size: usize)
     let mut readers = Vec::new();
 
     for file in files {
-        readers.push({ MessageBlock::new(file, block_size) });
+        readers.push({ MessageBlock::new(file, block_size, file_ids) });
     }
 
     // Send first blocks so file ids can be created
     readers.iter().for_each(|reader| {
-        reader
-            .into_iter()
-            // Send enough blocks for the first 16KiB
-            .chunks(FIRST_16K % block_size)
-            .into_iter()
-            .for_each(|chunk| {
-                chunk.for_each(|block| {
-                    let message = Message::Block(Arc::new(block));
-                    tx_router.send(message);
-                })
-            })
+        let message = Message::Block(Arc::new(reader.next().unwrap()));
+        tx_router.send(message);
     });
 
     // Close file id channel
@@ -375,86 +420,50 @@ fn get_input(tx_router: Sender<Message>, files: Vec<PathBuf>, block_size: usize)
 
     // Close block channels
     tx_router.send(Message::Close(Close::Block));
+
+    file_ids.par_sort_unstable();
 }
 
 // First Stage: Create file ids and partial bodies for FileDescription. Send
 // file ids, partial bodies and file readers to the correct channels.
-fn create_file_id(
-    tx_router: Sender<Message>,
-    files: Vec<PathBuf>,
-    mut file_ids: RwLockWriteGuard<Vec<[u8; 16]>>,
-) {
-    let (tx_id, rx_id): (Sender<[u8; 16]>, Receiver<[u8; 16]>) = channel();
+fn create_file_id(blocks: Vec<Arc<Vec<u8>>>, file: PathBuf, length: u64) -> Arc<[u8; 16]> {
+    // Get filename from path
+    let name = file
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes();
 
-    for file in files {
-        let tx_id = tx_id.clone();
-        let tx_router = tx_router.clone();
-        let mut reader = File::open(&file)
-            .with_context(|_| format!("Could not open file {}", file.display()))
-            .unwrap();
-        let mut buffer = [0; FIRST_16K];
-        reader.read(&mut buffer).unwrap();
+    // Hash first 16k of the file
+    let hash_16k = {
+        let mut hasher_16k = Md5::new();
+        let buffer: Vec<u8> = blocks
+            .iter()
+            .map(|block| block.iter())
+            .flatten()
+            .take(FIRST_16K)
+            .map(|byte| *byte)
+            .collect();
+        hasher_16k.input(buffer);
+        let result = hasher_16k.result();
+        let hash_16k = result.as_slice().to_owned();
+        Box::new(convert_to_byte_array(hash_16k))
+    };
 
-        // Spawn thread
-        spawn(move || {
-            // Get filename from path
-            let name = file
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-                .into_bytes();
+    // Generate File ID
+    let file_id = {
+        let mut hasher_file_id = Md5::new();
+        hasher_file_id.input(&*hash_16k);
+        hasher_file_id.input(&length.to_le_bytes());
+        hasher_file_id.input(&name);
+        let file_id = hasher_file_id.result().to_vec();
+        let file_id = convert_to_byte_array(file_id);
 
-            let length = {
-                let metadata = metadata(&file).unwrap();
-                metadata.len()
-            };
+        Arc::new(file_id)
+    };
 
-            // Hash first 16k of the file
-            let hash_16k = {
-                let mut hasher_16k = Md5::new();
-                for byte in buffer.iter() {
-                    hasher_16k.input([byte.to_owned()]);
-                }
-
-                let result = hasher_16k.result();
-                let hash_16k = result.as_slice().to_owned();
-                Box::new(convert_to_byte_array(hash_16k))
-            };
-
-            // Generate File ID
-            let file_id = {
-                let mut hasher_file_id = Md5::new();
-                hasher_file_id.input(&*hash_16k);
-                hasher_file_id.input(&length.to_le_bytes());
-                hasher_file_id.input(&name);
-                let file_id = hasher_file_id.result().to_vec();
-                let file_id = convert_to_byte_array(file_id);
-
-                Arc::new(file_id)
-            };
-
-            // Partial FileDescription (name, length, hash_16k)
-            let partial_body = (name, length, hash_16k, Arc::clone(&file_id));
-
-            // sender for channels
-            tx_id.send(*file_id).unwrap();
-            tx_router
-                .send(Message::Input((Arc::clone(&file_id), file, length)))
-                .unwrap();
-            tx_router
-                .send(Message::FileDescription(partial_body))
-                .unwrap();
-        });
-    }
-    drop(tx_id);
-
-    // Add to pipeline
-    for received in rx_id {
-        file_ids.push(received);
-    }
-
-    file_ids.par_sort_unstable();
+    file_id
 }
 
 // Second Stage
