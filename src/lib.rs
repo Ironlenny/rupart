@@ -152,7 +152,7 @@ impl Type for Creator {
 
 // Block Convenience struct. The spec references slices. Slices and blocks are
 // the same thing. A block is an array of 16-bit values
-#[derive(Eq)]
+// #[derive(Eq)]
 pub struct Block {
     file_id: Arc<[u8; 16]>,
     index: usize,
@@ -162,83 +162,83 @@ pub struct Block {
     length: u64,
 }
 
-impl PartialOrd for Block {
-    fn partial_cmp(&self, other: &Block) -> Option<Ordering> {
-        self.index.partial_cmp(&other.index)
-    }
-}
+// impl PartialOrd for Block {
+//     fn partial_cmp(&self, other: &Block) -> Option<Ordering> {
+//         self.index.partial_cmp(&other.index)
+//     }
+// }
 
-impl PartialEq for Block {
-    fn eq(&self, other: &Block) -> bool {
-        self.index == other.index
-    }
-}
+// impl PartialEq for Block {
+//     fn eq(&self, other: &Block) -> bool {
+//         self.index == other.index
+//     }
+// }
 
-impl Ord for Block {
-    fn cmp(&self, other: &Block) -> Ordering {
-        self.index.cmp(&other.index).reverse()
-    }
-}
+// impl Ord for Block {
+//     fn cmp(&self, other: &Block) -> Ordering {
+//         self.index.cmp(&other.index).reverse()
+//     }
+// }
 
 // The `Buffer` struct sorts and stores blocks for when they are needed
-struct Buffer {
-    heap: BinaryHeap<Arc<Block>>,
-    count: usize,
-    num_blocks: usize,
-}
+// struct Buffer {
+//     heap: BinaryHeap<Arc<Block>>,
+//     count: usize,
+//     num_blocks: usize,
+// }
 
-impl Buffer {
-    fn new() -> Self {
-        Buffer {
-            heap: BinaryHeap::new(),
-            count: 0,
-            num_blocks: 0,
-        }
-    }
+// impl Buffer {
+//     fn new() -> Self {
+//         Buffer {
+//             heap: BinaryHeap::new(),
+//             count: 0,
+//             num_blocks: 0,
+//         }
+//     }
 
-    fn is_done(&self) -> bool {
-        if self.num_blocks == self.count {
-            return true;
-        }
+//     fn is_done(&self) -> bool {
+//         if self.num_blocks == self.count {
+//             return true;
+//         }
 
-        false
-    }
+//         false
+//     }
 
-    fn process(&mut self, block: Arc<Block>) -> Option<Arc<Block>> {
-        let mut result = None;
+//     fn process(&mut self, block: Arc<Block>) -> Option<Arc<Block>> {
+//         let mut result = None;
 
-        if self.num_blocks == 0 {
-            self.num_blocks = block.num_blocks;
-        }
+//         if self.num_blocks == 0 {
+//             self.num_blocks = block.num_blocks;
+//         }
 
-        //Check for first blocks
-        if block.index == 0 {
-            self.count = self.count + 1;
-            result = Some(block);
-        }
-        // Check if current block is the one we need
-        else if self.count > 0 && block.index == self.count {
-            self.count = self.count + 1;
-            result = Some(block);
-        }
-        // Check if root is the one we need
-        else if !self.heap.is_empty() {
-            if {
-                let root = self.heap.peek().unwrap();
-                root.index
-            } == self.count
-            {
-                result = Some(self.heap.pop().unwrap());
-            }
-        }
-        // We can't use this block yet
-        else {
-            self.heap.push(block);
-        }
+//         //Check for first blocks
+//         if block.index == 0 {
+//             self.count = self.count + 1;
+//             result = Some(block);
+//         }
+//         // Check if current block is the one we need
+//         else if self.count > 0 && block.index == self.count {
+//             self.count = self.count + 1;
+//             result = Some(block);
+//         }
+//         // Check if root is the one we need
+//         else if !self.heap.is_empty() {
+//             if {
+//                 let root = self.heap.peek().unwrap();
+//                 root.index
+//             } == self.count
+//             {
+//                 result = Some(self.heap.pop().unwrap());
+//             }
+//         }
+//         // We can't use this block yet
+//         else {
+//             self.heap.push(block);
+//         }
 
-        result
-    }
-}
+//         result
+//     }
+// }
 
 // Body enum indicates the type of packet body, and contains a body struct
 pub enum Body {
@@ -250,7 +250,7 @@ pub enum Body {
 }
 
 // Signal which channel to close
-enum Close {
+pub enum Close {
     FileID,
     Block,
 }
@@ -285,7 +285,7 @@ fn get_input(
     mut file_ids: RwLockWriteGuard<Vec<[u8; 16]>>,
 ) {
     // `MessageBlock` is an iterator that makes `Blocks`
-    struct MessageBlock<'a> {
+    struct MessageBlock {
         path: PathBuf,
         file_id: Option<Arc<[u8; 16]>>,
         reader: File,
@@ -293,14 +293,12 @@ fn get_input(
         num_blocks: usize,
         length: u64,
         blocks: Vec<Arc<Vec<u8>>>,
-        file_ids: RwLockWriteGuard<'a, Vec<[u8; 16]>>,
     }
 
-    impl<'a> MessageBlock<'a> {
+    impl MessageBlock {
         fn new(
             path: PathBuf,
             block_size: usize,
-            file_ids: RwLockWriteGuard<'a, Vec<[u8; 16]>>,
         ) -> Self {
             let length = {
                 let metadata = metadata(&path).unwrap();
@@ -308,28 +306,26 @@ fn get_input(
             };
 
             MessageBlock {
-                path: path,
+                path: path.clone(),
                 file_id: None,
                 reader: { File::open(&path).unwrap() },
                 block_size: block_size,
                 num_blocks: { length as usize / block_size },
                 length: length,
                 blocks: Vec::new(),
-                file_ids: file_ids,
             }
         }
     }
 
-    impl<'a> Iterator for MessageBlock<'a> {
+    impl Iterator for MessageBlock {
         type Item = Block;
 
         fn next(&mut self) -> Option<Block> {
-            let take_bytes = (FIRST_16K % self.block_size + 1) * self.block_size;
 
             if self.file_id.is_none() {
+                let mut reader = &mut self.reader;
                 while self.blocks.len() <= FIRST_16K % self.block_size + 1 {
-                    match self
-                        .reader
+                    match reader
                         .bytes()
                         .chunks(self.block_size)
                         .into_iter()
@@ -345,16 +341,16 @@ fn get_input(
                     }
                 }
 
-                let file_id = create_file_id(self.blocks, self.path, self.length);
+                let file_id = create_file_id(&self.blocks, &self.path, self.length);
                 self.file_id = Some(file_id);
-                self.file_ids.push(*file_id);
             }
 
             if !self.blocks.is_empty() {
                 let (i, block) = self.blocks.iter().enumerate().next().unwrap();
+                let file_id = { if let Some(id) = self.file_id.clone() { id } else {panic!()}};
 
                 let message_block = Block {
-                    file_id: self.file_id.unwrap(),
+                    file_id: Arc::clone(&file_id),
                     index: i,
                     data: block.to_owned(),
                     block_size: self.block_size,
@@ -365,8 +361,8 @@ fn get_input(
                 return Some(message_block);
             }
 
-            let result = match self
-                .reader
+            let reader = &mut self.reader;
+            let result = match reader
                 .bytes()
                 .chunks(self.block_size)
                 .into_iter()
@@ -378,7 +374,7 @@ fn get_input(
                     let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
 
                     let message_block = Block {
-                        file_id: self.file_id.unwrap(),
+                        file_id: { if let Some(id) = self.file_id.clone() { id } else {panic!()}},
                         index: i,
                         data: block,
                         block_size: self.block_size,
@@ -398,25 +394,34 @@ fn get_input(
     let mut readers = Vec::new();
 
     for file in files {
-        readers.push({ MessageBlock::new(file, block_size, file_ids) });
+        readers.push({ MessageBlock::new(file, block_size) });
     }
 
     // Send first blocks so file ids can be created
-    readers.iter().for_each(|reader| {
-        let message = Message::Block(Arc::new(reader.next().unwrap()));
-        tx_router.send(message);
-    });
+    for reader in &mut readers {
+        let block = reader.next().unwrap();
+        file_ids.push(*block.file_id);
+        let message = Message::Block(Arc::new(block));
+        tx_router.send(message).unwrap();
+    }
 
     // Close file id channel
     tx_router.send(Message::Close(Close::FileID));
 
     // Send the rest of them
-    readers.iter().for_each(|reader| {
-        reader.for_each(|message| {
-            let message = Message::Block(Arc::new(message));
-            tx_router.send(message);
-        });
-    });
+    // readers.iter().for_each(|reader| {
+    //     reader.for_each(|message| {
+    //         let message = Message::Block(Arc::new(message));
+    //         tx_router.send(message);
+    //     });
+    // });
+
+    for reader in readers {
+        for block in reader {
+            let message = Message::Block(Arc::new(block));
+            tx_router.send(message).unwrap();
+        }
+    }
 
     // Close block channels
     tx_router.send(Message::Close(Close::Block));
@@ -426,7 +431,7 @@ fn get_input(
 
 // First Stage: Create file ids and partial bodies for FileDescription. Send
 // file ids, partial bodies and file readers to the correct channels.
-fn create_file_id(blocks: Vec<Arc<Vec<u8>>>, file: PathBuf, length: u64) -> Arc<[u8; 16]> {
+fn create_file_id(blocks: &Vec<Arc<Vec<u8>>>, file: &PathBuf, length: u64) -> Arc<[u8; 16]> {
     // Get filename from path
     let name = file
         .file_stem()
@@ -509,23 +514,13 @@ fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>) {
     for received in rx_input {
         let file_hash = Md5::new();
         let (tx_block, rx_block) = channel();
-        let mut block = match received {
+        let block = match received {
             Message::Input(input) => input,
             _ => panic!(),
         };
 
         // Check if block needs padding
-        if block.data.len() < block.block_size {
-            let mut temp: Arc<Vec<u8>> = Arc::new(vec![0; block.block_size]);
-
-            for i in 0..block.block_size {
-                temp[i] = block.data[i];
-            }
-
-            block.data = temp;
-        }
-
-        let block = block;
+        // let temp_vec = (*block.data).clone(); temp_vec.resize(block.block_size, 0)
 
         let body = Body::Input(Input {
             file_id: Arc::clone(&block.file_id),
@@ -534,7 +529,7 @@ fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>) {
                 let mut block_checksums: Vec<([u8; 16], u32)> =
                     vec![([0; 16], 0); block.num_blocks];
 
-                let tx_block = tx_block.clone();
+                let tx = tx_block.clone();
 
                 spawn(move || {
                     let mut md5_sum = Vec::new();
@@ -554,7 +549,7 @@ fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>) {
                     );
 
                     let result = (block.index, md5_sum, crc_sum);
-                    tx_block.send(result).unwrap();
+                    tx.send(result).unwrap();
                 });
 
                 // Close block channel
@@ -610,14 +605,12 @@ fn create_file_description(
     file_ids: Arc<RwLock<Vec<[u8; 16]>>>,
 ) {
     let file_ids = file_ids.read().unwrap();
-    let mut senders: HashMap<&[u8; 16], Sender<Arc<Block>>> = HashMap::new();
-    let mut buffers: HashMap<&[u8; 16], Buffer> = HashMap::new();
+    let mut senders: HashMap<&[u8; 16], (Sender<Arc<Block>>, usize)> = HashMap::new();
     let mut recvs = HashMap::new();
 
     for id in &*file_ids {
         let (tx, rx) = channel();
-        senders.insert(id, tx);
-        buffers.insert(id, Buffer::new());
+        senders.insert(id, (tx, 0));
         recvs.insert(id, rx);
     }
 
@@ -647,59 +640,23 @@ fn create_file_description(
 
                     tx_router.send(Message::Body(body)).unwrap();
                 });
-            }
+            },
             Message::Block(block) => {
                 let id = &*block.file_id;
-                let tx = &senders[id];
-                let mut buffer = buffers.get_mut(id).unwrap();
-                match buffer.process(block) {
-                    Some(block) => {
-                        tx.send(Arc::clone(&block)).unwrap();
+                let sender = senders.get_mut(id).unwrap();
+                let tx = &sender.0;
+                let mut count = sender.1;
+                tx.send(Arc::clone(&block)).unwrap();
+                count = count + 1;
 
-                        if buffer.is_done() {
-                            drop(tx);
-                        }
-
-                        continue;
-                    }
-                    None => continue,
+                if count >= block.num_blocks {
+                    drop(tx);
                 }
-            }
+
+            },
             _ => panic!("No valid message"),
         }
     }
-
-    // spawn(move || {
-    //     let hashers = Arc::clone(&hashers);
-    //     for received in rx_file_description {
-
-    //     }
-    // });
-
-    // for received in rx_fd {
-    //     let tx_body = tx_body.clone();
-
-    //     spawn(move || {
-    //     let (name, length, hash_16k, file_id) = match received {
-    //             Message::FileDescription(partial) => partial,
-    //             _ => panic!(),
-    //         };
-
-    //         let body = Body::FileDescription(FileDescription {
-    //             file_id: Arc::clone(&file_id),
-    //             file_hash: {
-    //                 let mut hasher = Md5::new();
-    //                 let hash = convert_to_byte_array(hasher.result().to_vec());
-    //                 hash
-    //             },
-    //             hash_16k: convert_to_byte_array(hash_16k),
-    //             length: length,
-    //             name: name,
-    //         });
-
-    //         tx_body.send(Message::Body(body)).unwrap();
-    //     });
-    // }
 }
 
 // Sixth Stage
