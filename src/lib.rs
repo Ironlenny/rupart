@@ -787,7 +787,7 @@ mod test {
         for block in rx_router {
             let block = match block {
                 Message::Block(block) => block,
-                _ => panic!("Got something other than a Block!")
+                _ => panic!("Got something other than a Block!"),
             };
 
             // Test file id
@@ -796,7 +796,10 @@ mod test {
             assert_eq!(block.index, counter, "Wrong index");
             counter = counter + 1;
             // Test data
-            assert_eq!(*block.data, *BLOCKS[block.index], "Block data doesn't match");
+            assert_eq!(
+                *block.data, *BLOCKS[block.index],
+                "Block data doesn't match"
+            );
             // Test length
             assert_eq!(block.length, LENGTH, "Wrong file length");
             // Test block_size
@@ -834,10 +837,18 @@ mod test {
         }
 
         let mut hashs = hashs_md5.into_iter().zip(hashs_crc.into_iter());
-        let input = Message::Input((Arc::new(FILE_ID.to_owned()), path, LENGTH));
+        let input = Message::Input(Block {
+            file_id: Arc::new(*FILE_ID),
+            index: 0,
+            data: Arc::new(*BLOCKS[0]),
+            block_size: BLOCK_SIZE,
+            num_blocks: 16,
+            length: LENGTH,
+        });
+
         tx_input.send(input);
         drop(tx_input);
-        create_input_body(rx_input, tx_router, block_size);
+        create_input_body(rx_input, tx_router);
         // End test setup
 
         // Test output
@@ -877,7 +888,7 @@ mod test {
                     // data at index
                     assert!({
                         let mut result = false;
-                        if *block.data == BLOCKS[block.index] {
+                        if *block.data == *BLOCKS[block.index] {
                             result = true
                         }
                         result
