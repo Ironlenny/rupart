@@ -764,6 +764,49 @@ mod test {
     }
 
     #[test]
+    fn make_blocks() {
+        // Test setup
+        let pipeline = CreatorPipeline::new();
+        let (tx_router, rx_router) = channel();
+        let mut file_ids = pipeline.file_ids.write().unwrap();
+        let files = {
+            let paths = Vec::new();
+
+            for _ in 0..5 {
+                paths.push(PathBuf::from(&*PATH))
+            }
+
+            paths
+        };
+
+        get_blocks(tx_router, files, BLOCK_SIZE, file_ids);
+        let mut counter = 0;
+        // End setup
+
+        // Test received
+        for block in rx_router {
+            let block = match block {
+                Message::Block(block) => block,
+                _ => panic!("Got something other than a Block!")
+            };
+
+            // Test file id
+            assert_eq!(*block.file_id, *FILE_ID, "Wrong file id");
+            // Test index
+            assert_eq!(block.index, counter, "Wrong index");
+            counter = counter + 1;
+            // Test data
+            assert_eq!(*block.data, *BLOCKS[block.index], "Block data doesn't match");
+            // Test length
+            assert_eq!(block.length, LENGTH, "Wrong file length");
+            // Test block_size
+            assert_eq!(block.block_size, BLOCK_SIZE, "Wrong block size");
+            // Test num_blocks
+            assert_eq!(block.num_blocks, 16, "Wrong number of blocks");
+        }
+    }
+
+    #[test]
     fn input_body_creation() {
         // Test setup
         let block_size = 65536;
