@@ -296,10 +296,7 @@ fn get_input(
     }
 
     impl MessageBlock {
-        fn new(
-            path: PathBuf,
-            block_size: usize,
-        ) -> Self {
+        fn new(path: PathBuf, block_size: usize) -> Self {
             let length = {
                 let metadata = metadata(&path).unwrap();
                 metadata.len()
@@ -321,7 +318,6 @@ fn get_input(
         type Item = Block;
 
         fn next(&mut self) -> Option<Block> {
-
             if self.file_id.is_none() {
                 let mut reader = &mut self.reader;
                 while self.blocks.len() <= FIRST_16K % self.block_size + 1 {
@@ -347,7 +343,13 @@ fn get_input(
 
             if !self.blocks.is_empty() {
                 let (i, block) = self.blocks.iter().enumerate().next().unwrap();
-                let file_id = { if let Some(id) = self.file_id.clone() { id } else {panic!()}};
+                let file_id = {
+                    if let Some(id) = self.file_id.clone() {
+                        id
+                    } else {
+                        panic!()
+                    }
+                };
 
                 let message_block = Block {
                     file_id: Arc::clone(&file_id),
@@ -374,7 +376,13 @@ fn get_input(
                     let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
 
                     let message_block = Block {
-                        file_id: { if let Some(id) = self.file_id.clone() { id } else {panic!()}},
+                        file_id: {
+                            if let Some(id) = self.file_id.clone() {
+                                id
+                            } else {
+                                panic!()
+                            }
+                        },
                         index: i,
                         data: block,
                         block_size: self.block_size,
@@ -640,7 +648,7 @@ fn create_file_description(
 
                     tx_router.send(Message::Body(body)).unwrap();
                 });
-            },
+            }
             Message::Block(block) => {
                 let id = &*block.file_id;
                 let sender = senders.get_mut(id).unwrap();
@@ -652,8 +660,7 @@ fn create_file_description(
                 if count >= block.num_blocks {
                     drop(tx);
                 }
-
-            },
+            }
             _ => panic!("No valid message"),
         }
     }
@@ -708,14 +715,15 @@ mod test {
     }
 
     lazy_static! {
-        static ref BLOCKS: Vec<Vec<u8>> = {
+        static ref BLOCKS: Vec<Arc<Vec<u8>>> = {
             let path = PathBuf::from(&PATH);
             let mut blocks = Vec::new();
             let reader = File::open(&path).unwrap();
 
             for chunk in reader.bytes().chunks(BLOCK_SIZE).into_iter() {
-                let block: Vec<u8> = chunk.map(|x| x.unwrap()).collect();
-                blocks.push(block.clone());
+                let block = chunk.map(|x| x.unwrap()).collect();
+                let block = Arc::new(block);
+                blocks.push(block);
             }
             blocks
         };
@@ -747,79 +755,12 @@ mod test {
     #[test]
     fn file_id_creation() {
         // Test setup
-        let mut path_vec = Vec::new();
         let path = PathBuf::from(&PATH);
-        let pipeline = CreatorPipeline::new();
-        let (tx_router, rx_router) = channel();
-
-        for _ in 0..1 {
-            path_vec.push(path.to_owned());
-        }
-
-        let lock = pipeline.file_ids.write().unwrap();
-        create_file_id(tx_router, path_vec, lock);
         // End setup
 
-        // Test input channel
-        for received in rx_router {
-            match received {
-                Message::Input(input) => {
-                    let received = input;
-
-                    // Test received
-                    assert_eq!(
-                        &*received.type_name_of(),
-                        "(std::sync::Arc<[u8; 16]>, std::path::PathBuf, u64)",
-                        "received type is wrong"
-                    );
-
-                    // Test file open
-                    assert!(
-                        {
-                            match File::open(&received.1) {
-                                Ok(_) => true,
-                                Err(_) => false,
-                            }
-                        },
-                        "Cannot open file"
-                    );
-
-                    // Test file_id hash
-                    assert_eq!(
-                        &received.0[..],
-                        *FILE_ID, // file id hash
-                        "File ID hash is wrong"
-                    );
-
-                    // Test length
-                    assert_eq!(LENGTH, received.2, "File length is wrong.");
-                }
-                Message::FileDescription(fd) => {
-                    let received = fd;
-                    // Test partial body
-                    assert_eq!(
-                        received.type_name_of(),
-                        "(std::vec::Vec<u8>, u64, std::boxed::Box<[u8; 16]>, std::sync::Arc<[u8; 16]>)",
-                        "partial body is wrong type"
-                    );
-
-                    // Test name
-                    assert_eq!(*NAME, received.0[..], "File name is wrong");
-                    // Test first 16k hash
-                    assert_eq!(*HASH_16K, received.2[..], "Hash of first 16k is wrong");
-                    // Test length
-                    assert_eq!(LENGTH, received.1, "length is wrong");
-
-                    // Test file_ids
-                    let file_ids = pipeline.file_ids.read().unwrap();
-
-                    for id in &*file_ids {
-                        assert_eq!(id, &*FILE_ID);
-                    }
-                }
-                _ => panic!("No valid message"),
-            }
-        }
+        // Test file id
+        let file_id = create_file_id(&*BLOCKS, &path, LENGTH);
+        assert_eq!(*file_id, *FILE_ID);
     }
 
     #[test]
