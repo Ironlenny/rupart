@@ -277,8 +277,8 @@ fn convert_to_byte_array(vec: Vec<u8>) -> [u8; 16] {
     temp
 }
 
-// `get_input()` makes `Blocks` from a file.
-fn get_input(
+// `get_blocks()` makes `Blocks` from a file.
+fn get_blocks(
     tx_router: Sender<Message>,
     files: Vec<PathBuf>,
     block_size: usize,
