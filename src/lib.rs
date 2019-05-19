@@ -840,7 +840,7 @@ mod test {
         let input = Message::Input(Block {
             file_id: Arc::new(*FILE_ID),
             index: 0,
-            data: Arc::new(*BLOCKS[0]),
+            data: Arc::clone(&BLOCKS[0]),
             block_size: BLOCK_SIZE,
             num_blocks: 16,
             length: LENGTH,
@@ -879,22 +879,6 @@ mod test {
 
                     // Should have 16 blocks
                     assert_eq!(count, 16);
-                }
-                Message::Block(block) => {
-                    let block = block;
-                    // Tests
-                    // file id
-                    assert_eq!(*block.file_id, *FILE_ID);
-                    // data at index
-                    assert!({
-                        let mut result = false;
-                        if *block.data == *BLOCKS[block.index] {
-                            result = true
-                        }
-                        result
-                    });
-                    // vec_length
-                    assert_eq!(block.num_blocks, num_blocks);
                 }
                 _ => panic!("No valid message"),
             }
