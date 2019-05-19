@@ -770,7 +770,7 @@ mod test {
         let (tx_router, rx_router) = channel();
         let mut file_ids = pipeline.file_ids.write().unwrap();
         let files = {
-            let paths = Vec::new();
+            let mut paths = Vec::new();
 
             for _ in 0..5 {
                 paths.push(PathBuf::from(&*PATH))
@@ -891,11 +891,8 @@ mod test {
         const FIRST_16K: usize = 16384;
         let (tx_fd, rx_fd) = channel();
         let (tx_router, rx_router) = channel();
-        let path = PathBuf::from(&PATH);
         let file_ids = Arc::new(RwLock::new(vec![FILE_ID.to_owned()]));
-        let mut reader = File::open(&path).unwrap();
         let mut buffer = [0; FIRST_16K];
-        let reader = File::open(&path).unwrap();
 
         for (i, block) in BLOCKS.iter().enumerate() {
             if i == 0 {
@@ -906,14 +903,13 @@ mod test {
                 }
             }
 
-            let block = Arc::new(block.to_owned());
-
             let message_block = Arc::new(Block {
-                file_id: Arc::new(FILE_ID.to_owned()),
-                index: i.clone(),
-                data: Arc::clone(&block),
-                // vec_length: BLOCK_SIZE,
-                num_blocks: *NUM_BLOCKS,
+                file_id: Arc::new(*FILE_ID),
+                index: 0,
+                data: Arc::new(block.to_vec()),
+                block_size: BLOCK_SIZE,
+                num_blocks: 16,
+                length: LENGTH,
             });
 
             tx_fd.send(Message::Block(message_block));
