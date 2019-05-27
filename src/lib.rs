@@ -266,6 +266,119 @@ pub enum Message {
     Close(Close),                                                  // Close a channel
 }
 
+// `MessageBlock` is an iterator that makes `Blocks`
+struct MessageBlock {
+    path: PathBuf,
+    file_id: Option<Arc<[u8; 16]>>,
+    reader: IntoChunks<std::io::Bytes<File>>,
+    block_size: usize,
+    num_blocks: usize,
+    length: u64,
+    blocks: Vec<Arc<Vec<u8>>>,
+    count: usize,
+}
+
+impl MessageBlock {
+    fn new(path: PathBuf, block_size: usize) -> Self {
+        let length = {
+            let metadata = metadata(&path).unwrap();
+            metadata.len()
+        };
+
+        MessageBlock {
+            path: path.clone(),
+            file_id: None,
+            reader: { let reader = File::open(&path).unwrap(); reader.bytes().chunks(block_size) },
+            block_size: block_size,
+            num_blocks: { length as usize / block_size },
+            length: length,
+            blocks: Vec::new(),
+            count: 0,
+        }
+    }
+
+    fn next_helper(&mut self) -> Option<Arc<Vec<u8>>> {
+        let reader = &mut self.reader.into_iter();
+        match reader.next() {
+            Some(chunk) => {
+                let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
+                self.count = self.count + 1;
+                Some(block)
+            }
+            None => None,
+        }
+    }
+}
+
+impl Iterator for MessageBlock {
+    type Item = Block;
+
+    fn next(&mut self) -> Option<Block> {
+        let mut result;
+        // Check if there's a file id. Create one if not.
+        if self.file_id.is_none() {
+            while self.blocks.len() < self.block_size % FIRST_16K + 1 {
+                match self.next_helper() {
+                    Some(block) => self.blocks.push(block),
+                    None => panic!("Out of bytes"),
+                }
+            }
+
+            let file_id = create_file_id(&self.blocks, &self.path, self.length);
+            self.file_id = Some(file_id);
+        }
+
+        // Check if `blocks` buffer is empty. Drain it if not.
+        if !self.blocks.is_empty() {
+            let index = self.count - self.blocks.len();
+            let block = self.blocks.remove(0);
+            let file_id = {
+                if let Some(id) = self.file_id.clone() {
+                    id
+                } else {
+                    panic!("No file id!")
+                }
+            };
+
+            let message_block = Block {
+                file_id: Arc::clone(&file_id),
+                index: index,
+                data: block.to_owned(),
+                block_size: self.block_size,
+                num_blocks: self.num_blocks,
+                length: self.length,
+            };
+
+            result = Some(message_block);
+        } else {
+            // Get next block and return it.
+            result = match self.next_helper() {
+                Some(block) => {
+                    let message_block = Block {
+                        file_id: {
+                            if let Some(id) = self.file_id.clone() {
+                                id
+                            } else {
+                                panic!("No file id!")
+                            }
+                        },
+                        index: self.count - 1,
+                        data: block,
+                        block_size: self.block_size,
+                        num_blocks: self.num_blocks,
+                        length: self.length,
+                    };
+
+                    Some(message_block)
+                }
+                None => None,
+            };
+        }
+
+        result
+    }
+}
+
 // Helper function to convert Vec's to byte arrays
 fn convert_to_byte_array(vec: Vec<u8>) -> [u8; 16] {
     let mut temp: [u8; 16] = [0; 16];
@@ -284,121 +397,6 @@ fn get_blocks(
     block_size: usize,
     mut file_ids: RwLockWriteGuard<Vec<[u8; 16]>>,
 ) {
-    // `MessageBlock` is an iterator that makes `Blocks`
-    struct MessageBlock {
-        path: PathBuf,
-        file_id: Option<Arc<[u8; 16]>>,
-        reader: File,
-        block_size: usize,
-        num_blocks: usize,
-        length: u64,
-        blocks: Vec<Arc<Vec<u8>>>,
-    }
-
-    impl MessageBlock {
-        fn new(path: PathBuf, block_size: usize) -> Self {
-            let length = {
-                let metadata = metadata(&path).unwrap();
-                metadata.len()
-            };
-
-            MessageBlock {
-                path: path.clone(),
-                file_id: None,
-                reader: { File::open(&path).unwrap() },
-                block_size: block_size,
-                num_blocks: { length as usize / block_size },
-                length: length,
-                blocks: Vec::new(),
-            }
-        }
-    }
-
-    impl Iterator for MessageBlock {
-        type Item = Block;
-
-        fn next(&mut self) -> Option<Block> {
-            if self.file_id.is_none() {
-                let mut reader = &mut self.reader;
-                while self.blocks.len() <= FIRST_16K % self.block_size + 1 {
-                    match reader
-                        .bytes()
-                        .chunks(self.block_size)
-                        .into_iter()
-                        .enumerate()
-                        .next()
-                    {
-                        Some(next) => {
-                            let (i, chunk) = next;
-                            let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
-                            self.blocks.push(block);
-                        }
-                        None => panic!("Empty file"),
-                    }
-                }
-
-                let file_id = create_file_id(&self.blocks, &self.path, self.length);
-                self.file_id = Some(file_id);
-            }
-
-            if !self.blocks.is_empty() {
-                let (i, block) = self.blocks.iter().enumerate().next().unwrap();
-                let file_id = {
-                    if let Some(id) = self.file_id.clone() {
-                        id
-                    } else {
-                        panic!()
-                    }
-                };
-
-                let message_block = Block {
-                    file_id: Arc::clone(&file_id),
-                    index: i,
-                    data: block.to_owned(),
-                    block_size: self.block_size,
-                    num_blocks: self.num_blocks,
-                    length: self.length,
-                };
-
-                return Some(message_block);
-            }
-
-            let reader = &mut self.reader;
-            let result = match reader
-                .bytes()
-                .chunks(self.block_size)
-                .into_iter()
-                .enumerate()
-                .next()
-            {
-                Some(next) => {
-                    let (i, chunk) = next;
-                    let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
-
-                    let message_block = Block {
-                        file_id: {
-                            if let Some(id) = self.file_id.clone() {
-                                id
-                            } else {
-                                panic!()
-                            }
-                        },
-                        index: i,
-                        data: block,
-                        block_size: self.block_size,
-                        num_blocks: self.num_blocks,
-                        length: self.length,
-                    };
-
-                    Some(message_block)
-                }
-                None => None,
-            };
-
-            result
-        }
-    }
-
     let mut readers = Vec::new();
 
     for file in files {
@@ -416,13 +414,11 @@ fn get_blocks(
     // Close file id channel
     tx_router.send(Message::Close(Close::FileID));
 
-    // Send the rest of them
-    // readers.iter().for_each(|reader| {
-    //     reader.for_each(|message| {
-    //         let message = Message::Block(Arc::new(message));
-    //         tx_router.send(message);
-    //     });
-    // });
+    // Sort file ids
+    file_ids.par_sort_unstable();
+
+    // Drop lock
+    drop(file_ids);
 
     for reader in readers {
         for block in reader {
@@ -433,8 +429,6 @@ fn get_blocks(
 
     // Close block channels
     tx_router.send(Message::Close(Close::Block));
-
-    file_ids.par_sort_unstable();
 }
 
 // First Stage: Create file ids and partial bodies for FileDescription. Send
@@ -692,6 +686,7 @@ mod test {
     use lazy_static::lazy_static;
     use md5::{Digest, Md5};
     use rayon::join;
+    use std::fs;
     use std::fs::File;
     use std::path::PathBuf;
     use typename::TypeName;
@@ -721,8 +716,7 @@ mod test {
             let reader = File::open(&path).unwrap();
 
             for chunk in reader.bytes().chunks(BLOCK_SIZE).into_iter() {
-                let block = chunk.map(|x| x.unwrap()).collect();
-                let block = Arc::new(block);
+                let block = Arc::new(chunk.map(|x| x.unwrap()).collect());
                 blocks.push(block);
             }
             blocks
@@ -764,48 +758,101 @@ mod test {
     }
 
     #[test]
+    fn block_test() {
+        // Test setup
+        let first_block = fs::read("/home/jacob/projects/rupart/first_block").unwrap();
+        let second_block = fs::read("/home/jacob/projects/rupart/second_block").unwrap();
+        let reader = File::open(PathBuf::from(PATH)).unwrap();
+        let reader = reader.bytes().chunks(BLOCK_SIZE);
+        let mut reader = reader.into_iter();
+        let mut iter = MessageBlock::new(PathBuf::from(PATH), BLOCK_SIZE);
+        let first_test = match reader.next() {
+            Some(chunk) => {
+                let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
+                Some(block)
+            }
+            None => panic!(),
+        };
+        let second_test = match reader.next() {
+            Some(chunk) => {
+                let block: Arc<Vec<u8>> = Arc::new(chunk.map(|x| x.unwrap()).collect());
+                Some(block)
+            }
+            None => panic!(),
+        };
+        let first_message_block = (iter.next().unwrap()).data;
+        let second_message_block = (iter.next().unwrap()).data;
+        // End setup
+
+        assert_eq!(first_block, *(first_test.unwrap()), "first test failed");
+        assert_eq!(second_block, *(second_test.unwrap()), "second test failed");
+        assert_eq!(
+            first_block, *BLOCKS[0],
+            "first `BLOCKS` block doesn't match"
+        );
+        assert_eq!(
+            second_block, *BLOCKS[1],
+            "second `BLOCKS` block doesn't match"
+        );
+        assert_eq!(
+            first_message_block.len(),
+            first_block.len(),
+            "first `MessageBlock` length is wrong"
+        );
+        assert_eq!(
+            second_message_block.len(),
+            second_block.len(),
+            "second `MessageBlock` length is wrong"
+        );
+        assert_eq!(
+            *first_message_block, *BLOCKS[0],
+            "first `MessageBlock` block doesn't match"
+        );
+        assert_eq!(
+            *second_message_block, *BLOCKS[1],
+            "second `MessageBlock` doesn't match"
+        );
+    }
+
+    #[test]
     fn make_blocks() {
         // Test setup
         let pipeline = CreatorPipeline::new();
         let (tx_router, rx_router) = channel();
         let mut file_ids = pipeline.file_ids.write().unwrap();
-        let files = {
-            let mut paths = Vec::new();
-
-            for _ in 0..5 {
-                paths.push(PathBuf::from(&*PATH))
-            }
-
-            paths
-        };
+        let files = vec![PathBuf::from(&PATH)];
 
         get_blocks(tx_router, files, BLOCK_SIZE, file_ids);
-        let mut counter = 0;
+        let mut count = 0;
         // End setup
 
         // Test received
         for block in rx_router {
-            let block = match block {
-                Message::Block(block) => block,
-                _ => panic!("Got something other than a Block!"),
-            };
-
-            // Test file id
-            assert_eq!(*block.file_id, *FILE_ID, "Wrong file id");
-            // Test index
-            assert_eq!(block.index, counter, "Wrong index");
-            counter = counter + 1;
-            // Test data
-            assert_eq!(
-                *block.data, *BLOCKS[block.index],
-                "Block data doesn't match"
-            );
-            // Test length
-            assert_eq!(block.length, LENGTH, "Wrong file length");
-            // Test block_size
-            assert_eq!(block.block_size, BLOCK_SIZE, "Wrong block size");
-            // Test num_blocks
-            assert_eq!(block.num_blocks, 16, "Wrong number of blocks");
+            match block {
+                Message::Block(block) => {
+                    // Test file id
+                    assert_eq!(*block.file_id, *FILE_ID, "Wrong file id");
+                    // Test index
+                    assert_eq!(block.index, count, "Wrong index");
+                    count = count + 1;
+                    // Test data
+                    assert_eq!(
+                        *block.data,
+                        *BLOCKS[block.index],
+                        "Block data doesn't match. Index is {}",
+                        block.index.to_string()
+                    );
+                    // Test length
+                    assert_eq!(block.length, LENGTH, "Wrong file length");
+                    // Test block_size
+                    assert_eq!(block.block_size, BLOCK_SIZE, "Wrong block size");
+                    // Test num_blocks
+                    assert_eq!(block.num_blocks, 16, "Wrong number of blocks");
+                }
+                Message::Close(Close::Block) => continue,
+                Message::Close(Close::FileID) => continue,
+                _ => panic!("No valid message received"),
+            }
         }
     }
 
