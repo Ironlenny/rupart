@@ -5,6 +5,7 @@
 #![allow(dead_code, unused_must_use)]
 use crc32fast::Hasher;
 use failure::ResultExt;
+use itertools::structs::IntoChunks;
 use itertools::Itertools;
 use md5::{Digest, Md5};
 use rayon::prelude::*;
@@ -153,6 +154,7 @@ impl Type for Creator {
 // Block Convenience struct. The spec references slices. Slices and blocks are
 // the same thing. A block is an array of 16-bit values
 // #[derive(Eq)]
+#[derive(Debug)]
 pub struct Block {
     file_id: Arc<[u8; 16]>,
     index: usize,
@@ -288,7 +290,10 @@ impl MessageBlock {
         MessageBlock {
             path: path.clone(),
             file_id: None,
-            reader: { let reader = File::open(&path).unwrap(); reader.bytes().chunks(block_size) },
+            reader: {
+                let reader = File::open(&path).unwrap();
+                reader.bytes().chunks(block_size)
+            },
             block_size: block_size,
             num_blocks: { length as usize / block_size },
             length: length,
@@ -513,60 +518,79 @@ fn create_main(
 // containing file id and block checksums. Iterate through the file reader calculating
 // block hashs. Put hashs in a Vec. Send complete body to create_packet(). Bock size is bytes
 fn create_input_body(rx_input: Receiver<Message>, tx_router: Sender<Message>) {
-    for received in rx_input {
-        let file_hash = Md5::new();
-        let (tx_block, rx_block) = channel();
-        let block = match received {
+    // senders<file_id, (Sender, block_count)>
+    let mut senders: HashMap<Arc<[u8; 16]>, (Sender<(usize, Vec<u8>, u32)>, usize)> =
+        HashMap::new();
+
+    for recvd in rx_input {
+        let block = match recvd {
             Message::Input(input) => input,
             _ => panic!(),
         };
 
-        // Check if block needs padding
-        // let temp_vec = (*block.data).clone(); temp_vec.resize(block.block_size, 0)
+        let file_id = Arc::clone(&block.file_id);
+        let num_blocks = block.num_blocks;
 
-        let body = Body::Input(Input {
-            file_id: Arc::clone(&block.file_id),
-            block_checksums: {
+        // Check if file id is in hashmap. If not, open channel and spawn job.
+        if !senders.contains_key(&*file_id) {
+            let file_id = Arc::clone(&file_id);
+            // Open channel for file id
+            let (tx, rx) = channel();
+            // Add sender to hashmap
+            senders.insert(file_id, (tx, 0));
+            // Clone router transmitter
+            let tx_router = tx_router.clone();
+            let num_blocks = block.num_blocks;
+            // file_id has moved. Make new binding
+            let file_id = Arc::clone(&block.file_id);
+
+            spawn(move || {
                 // Pre-allocate block_checksums vector to eliminate the need for sorting
-                let mut block_checksums: Vec<([u8; 16], u32)> =
-                    vec![([0; 16], 0); block.num_blocks];
+                let mut block_checksums: Vec<([u8; 16], u32)> = vec![([0; 16], 0); num_blocks];
 
-                let tx = tx_block.clone();
-
-                spawn(move || {
-                    let mut md5_sum = Vec::new();
-                    let mut crc_sum = 0;
-
-                    join(
-                        || {
-                            let mut hasher_md5 = Md5::new();
-                            hasher_md5.input(&*block.data);
-                            md5_sum = hasher_md5.result().to_vec();
-                        },
-                        || {
-                            let mut hasher_crc32 = Hasher::new();
-                            hasher_crc32.update(&*block.data);
-                            crc_sum = hasher_crc32.finalize();
-                        },
-                    );
-
-                    let result = (block.index, md5_sum, crc_sum);
-                    tx.send(result).unwrap();
-                });
-
-                // Close block channel
-                drop(tx_block);
-
-                for block in rx_block {
-                    let (index, md5, crc) = block;
+                for recvd in rx {
+                    let (index, md5, crc) = recvd;
                     block_checksums[index] = (convert_to_byte_array(md5), crc);
                 }
 
-                block_checksums
-            },
+                let body = Body::Input(Input {
+                    file_id: Arc::clone(&file_id),
+                    block_checksums: block_checksums,
+                });
+
+                tx_router.send(Message::Body(body)).unwrap();
+            });
+        }
+
+        let sender = senders.get_mut(&*file_id).unwrap();
+        let tx = sender.0.clone();
+        // Increment block count
+        sender.1 += 1;
+
+        spawn(move || {
+            let mut md5_sum = Vec::new();
+            let mut crc_sum = 0;
+
+            join(
+                || {
+                    let hasher_md5 = Md5::digest(&*block.data);
+                    md5_sum = hasher_md5.to_vec();
+                },
+                || {
+                    let mut hasher_crc32 = Hasher::new();
+                    hasher_crc32.update(&*block.data);
+                    crc_sum = hasher_crc32.finalize();
+                },
+            );
+
+            let result = (block.index, md5_sum, crc_sum);
+            tx.send(result).unwrap();
         });
 
-        tx_router.send(Message::Body(body)).unwrap();
+        // Close block channel if count greater than or equal to number of blocks
+        if sender.1 >= num_blocks {
+            senders.remove(&*file_id);
+        }
     }
 }
 
@@ -607,6 +631,7 @@ fn create_file_description(
     file_ids: Arc<RwLock<Vec<[u8; 16]>>>,
 ) {
     let file_ids = file_ids.read().unwrap();
+    // HashMap<file_id, (block sender, block count)>
     let mut senders: HashMap<&[u8; 16], (Sender<Arc<Block>>, usize)> = HashMap::new();
     let mut recvs = HashMap::new();
 
@@ -649,8 +674,11 @@ fn create_file_description(
                 let tx = &sender.0;
                 let mut count = sender.1;
                 tx.send(Arc::clone(&block)).unwrap();
+
+                // Count blocks sent
                 count = count + 1;
 
+                // Check if all blocks have been sent
                 if count >= block.num_blocks {
                     drop(tx);
                 }
@@ -884,16 +912,25 @@ mod test {
         }
 
         let mut hashs = hashs_md5.into_iter().zip(hashs_crc.into_iter());
-        let input = Message::Input(Block {
-            file_id: Arc::new(*FILE_ID),
-            index: 0,
-            data: Arc::clone(&BLOCKS[0]),
-            block_size: BLOCK_SIZE,
-            num_blocks: 16,
-            length: LENGTH,
-        });
 
-        tx_input.send(input);
+        let blocks = &BLOCKS.clone();
+
+        let mut index = 0;
+
+        for block in blocks {
+            let input = Message::Input(Block {
+                file_id: Arc::new(*FILE_ID),
+                index: index,
+                data: Arc::clone(&block),
+                block_size: BLOCK_SIZE,
+                num_blocks: 16,
+                length: LENGTH,
+            });
+
+            index += 1;
+            tx_input.send(input);
+        }
+
         drop(tx_input);
         create_input_body(rx_input, tx_router);
         // End test setup
